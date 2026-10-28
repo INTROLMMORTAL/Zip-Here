@@ -1,0 +1,8 @@
+dist/
+bin/
+obj/
+*.exe
+*.pdb
+*.obj
+.vs/
+Thumbs.db
