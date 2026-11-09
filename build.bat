@@ -12,11 +12,13 @@ if not exist "%CSC%" (
 )
 
 if not exist dist mkdir dist
+   set RES=
+   if exist third_party\UnRAR.exe set RES=/resource:third_party\UnRAR.exe,UnRAR.exe
 
 "%CSC%" /nologo /target:winexe /optimize+ /codepage:65001 /out:dist\ZipHereSetup.exe ^
   /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
   /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll ^
-  /r:Microsoft.VisualBasic.dll ^
+      /r:Microsoft.VisualBasic.dll %RES% ^
   src\Installer.cs
 if errorlevel 1 (
   echo Сборка не удалась.
