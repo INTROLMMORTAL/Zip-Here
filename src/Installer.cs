@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("Extract-here context menu and automatic unpacking of downloaded ZIP, RAR, 7z and TAR archives")]
 [assembly: AssemblyProduct("ZipHere")]
 [assembly: AssemblyCompany("ZipHere contributors")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
 
 static class Program
 {
@@ -210,7 +210,39 @@ static class Program
             pf64 == null ? null : Path.Combine(pf64, @"WinRAR\UnRAR.exe"),
             pf86 == null ? null : Path.Combine(pf86, @"WinRAR\UnRAR.exe")
         });
-        return found ?? FindInPath("UnRAR.exe");
+        if (found != null) return found;
+        found = FindInPath("UnRAR.exe");
+        if (found != null) return found;
+        return ExtractEmbeddedUnrar(); // запасной вариант: UnRAR.exe, вшитый в сам ZipHere
+    }
+
+    // UnRAR.exe может быть вшит в ZipHere как ресурс (см. build.bat). Он нужен, потому что
+    // tar.exe из Windows не читает RAR с большим словарём («Declared dictionary size is not supported»).
+    // Распаковывается в папку установки при первом обращении, удаляется вместе с ZipHere.
+    static string ExtractEmbeddedUnrar()
+    {
+        string target = Path.Combine(InstallDir, "UnRAR.exe");
+        try
+        {
+            using (Stream res = Assembly.GetExecutingAssembly().GetManifestResourceStream("UnRAR.exe"))
+            {
+                if (res == null) return null;
+                if (File.Exists(target) && new FileInfo(target).Length == res.Length) return target;
+                Directory.CreateDirectory(InstallDir);
+                using (FileStream fs = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.Read))
+                {
+                    byte[] buf = new byte[81920];
+                    int n;
+                    while ((n = res.Read(buf, 0, buf.Length)) > 0) fs.Write(buf, 0, n);
+                }
+                return target;
+            }
+        }
+        catch
+        {
+            // например, файл занят параллельной распаковкой: если он уже есть, используем его
+            return File.Exists(target) ? target : null;
+        }
     }
 
     // tar.exe (bsdtar на libarchive) входит в Windows 10/11 и умеет читать RAR, 7z, tar.* и др.
@@ -277,20 +309,27 @@ static class Program
         foreach (string raw in output.Split('\n'))
         {
             string l = raw.Trim();
-            if (l.Length > 0) lines.Add(l);
+            if (l.Length == 0) continue;
+            // Служебный итог bsdtar: настоящая причина написана выше него.
+            if (l.IndexOf("Error exit delayed", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+            lines.Add(l);
         }
+
         List<string> pick = new List<string>();
+        // 7-Zip помечает ошибки словом ERROR; в начале его вывода идёт шапка с версией.
         foreach (string l in lines)
         {
-            if (l.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 && pick.Count < 3) pick.Add(l);
+            if (l.IndexOf("ERROR", StringComparison.OrdinalIgnoreCase) >= 0 && pick.Count < 3) pick.Add(l);
         }
+        // Иначе берём первые строки: у tar причина в начале.
         if (pick.Count == 0)
         {
-            for (int i = Math.Max(0, lines.Count - 3); i < lines.Count; i++) pick.Add(lines[i]);
+            for (int i = 0; i < lines.Count && i < 4; i++) pick.Add(lines[i]);
         }
+
         string text = string.Join("\n", pick.ToArray());
-        if (text.Length == 0) text = "Распаковщик завершился с кодом " + code + ".";
-        if (text.Length > 400) text = text.Substring(0, 400) + "…";
+        if (text.Length == 0) text = "Распаковщик завершился с кодом " + code + " без пояснений.";
+        if (text.Length > 400) text = text.Substring(0, 400) + "...";
         return text;
     }
 
@@ -337,20 +376,21 @@ static class Program
         }
     }
 
-    // Возвращает null при успехе, иначе текст последней ошибки.
+    // Возвращает null при успехе, иначе ошибки всех попробованных распаковщиков.
     static string ExtractExternal(string archive, string dest, string kind)
     {
         bool isRar = kind == "rar" ||
             (kind == "unknown" && archive.EndsWith(".rar", StringComparison.OrdinalIgnoreCase));
         bool multi = IsMultiVolumeStart(archive);
-        string lastError = null;
+        List<string> errors = new List<string>();
 
         // 1. 7-Zip, если установлен: самый полный по форматам.
         string z = Find7z();
         if (z != null)
         {
-            lastError = Attempt(dest, delegate { return Run7z(z, archive, dest); });
-            if (lastError == null) return null;
+            string err = Attempt(dest, delegate { return Run7z(z, archive, dest); });
+            if (err == null) return null;
+            errors.Add("7-Zip: " + err);
         }
 
         // 2. UnRAR из WinRAR, если установлен.
@@ -359,8 +399,9 @@ static class Program
             string u = FindUnrar();
             if (u != null)
             {
-                lastError = Attempt(dest, delegate { return RunUnrar(u, archive, dest); });
-                if (lastError == null) return null;
+                string err = Attempt(dest, delegate { return RunUnrar(u, archive, dest); });
+                if (err == null) return null;
+                errors.Add("UnRAR: " + err);
             }
         }
 
@@ -370,16 +411,17 @@ static class Program
             string t = FindTar();
             if (t != null)
             {
-                lastError = Attempt(dest, delegate { return RunTar(t, archive, dest); });
-                if (lastError == null) return null;
+                string err = Attempt(dest, delegate { return RunTar(t, archive, dest); });
+                if (err == null) return null;
+                errors.Add("tar (Windows): " + err);
             }
         }
 
-        if (lastError == null)
-            lastError = multi
+        if (errors.Count == 0)
+            return multi
                 ? "Это многотомный архив: для него нужен 7-Zip или WinRAR."
                 : "В системе не найден распаковщик для этого формата.";
-        return lastError;
+        return string.Join("\n", errors.ToArray());
     }
 
     static void Extract(string archive, string dest)
